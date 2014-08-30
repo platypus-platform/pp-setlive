@@ -30,83 +30,14 @@ func main() {
 		RunitPath:        "/var/service",
 	}
 
-	c := make(chan WorkSpec)
+	c := make(chan IntentNode)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for w := range c {
-			if w.Version == "" {
-				// TODO: Ensure stopped
-				Info("No active version for %s, skipping", w.App)
-				continue
-			}
-
-			install := path.Join(w.Basedir, "installs", w.App+"_"+w.Version)
-			current := path.Join(w.Basedir, "current")
-
-			if _, err := os.Stat(install); os.IsNotExist(err) {
-				Info("%s/%s has not been prepared, skipping", w.App, w.Version)
-				continue
-			}
-
-			// TODO: obtain lease before stopping, only if running
-			Info("Stopping %s", w.App)
-			cmd := exec.Command("sv", "stop", path.Join(config.RunitPath, w.App))
-			if err := cmd.Run(); err != nil {
-				Fatal("Could not stop %s: %s", w.App, err)
-				continue
-			}
-
-			// Ensure servicebuilder files up-to-date
-			// TODO: How to provide all our custom options here? Template?
-			Info("Writing servicebuilder config")
-			sb := map[string]interface{}{}
-			sb[w.App] = map[string][]string{
-				"run": []string{
-					path.Join(w.Basedir, "current/bin/launch"), // TODO Support directory
-				},
-			}
-			data, err := yaml.Marshal(&sb)
-			if err != nil {
-				Fatal("Could not generate servicebuilder config: %s", err)
-				continue
-			}
-			sbFile := path.Join(config.Sbpath, w.App+".yaml")
-			err = ioutil.WriteFile(sbFile, data, 0644)
-			if err != nil {
-				Fatal("Could not write servicebuilder config: %s", err)
-				continue
-			}
-
-			sbCmd := exec.Command("servicebuilder",
-				"-c", config.Sbpath,
-				"-d", config.RunitPath,
-				"-s", config.RunitStagingPath,
-			)
-			if err := sbCmd.Run(); err != nil {
-				Fatal("Could not run servicebuilder: %s", w.App, err)
-				continue
-			}
-
-			Info("Symlinking")
-
-			if err := os.Remove(current); err != nil {
-				Fatal("Could not remove current symlink: %s", err)
-				continue
-			}
-
-			if err := os.Symlink(install, current); err != nil {
-				Fatal("Could not symlink current: %s", err)
-				continue
-			}
-
-			Info("Starting %s", w.App)
-
-			cmd = exec.Command("sv", "start", path.Join(config.RunitPath, w.App))
-			if err := cmd.Run(); err != nil {
-				Fatal("Could not start %s: %s", w.App, err)
-				continue
+		for intent := range c {
+			for _, app := range intent.Apps {
+				setLive(config, app)
 			}
 		}
 	}()
@@ -118,22 +49,122 @@ func main() {
 		Fatal(err.Error())
 		os.Exit(1)
 	}
-
 }
 
-type WorkSpec struct {
-	App     string
-	Version string
-	Basedir string
+func setLive(config SetliveConfig, app IntentApp) {
+	version := app.ActiveVersion()
+
+	if version == "" {
+		// TODO: Ensure stopped
+		Info("%s: No active version, skipping", app.Name)
+		return
+	}
+
+	install := path.Join(app.Basedir, "installs", app.Name+"_"+version)
+	current := path.Join(app.Basedir, "current")
+
+	if _, err := os.Stat(install); os.IsNotExist(err) {
+		Info("%s: not prepared, skipping", app)
+		return
+	}
+
+	// TODO: obtain lease before stopping, only if running
+	Info("%s: Stopping", app.Name)
+	cmd := exec.Command("sv", "stop", path.Join(config.RunitPath, app.Name))
+	if err := cmd.Run(); err != nil {
+		Fatal("%s: Could not stop: %s", app.Name, err)
+		return
+	}
+
+	// Ensure servicebuilder files up-to-date
+	// TODO: How to provide all our custom options here? Template?
+	Info("%s: Configuring service builder", app.Name)
+	if err := configureServiceBuilder(config, app); err != nil {
+		Fatal("%s: Could not configure servicebuilder: %s", app.Name, err)
+		return
+	}
+
+	Info("%s: Symlinking", app.Name)
+
+	if err := os.Remove(current); err != nil {
+		Fatal("%s: Could not remove current symlink: %s", app.Name, err)
+		return
+	}
+
+	if err := os.Symlink(install, current); err != nil {
+		Fatal("%s: Could not symlink current: %s", app.Name, err)
+		return
+	}
+
+	Info("%s: Starting", app.Name)
+
+	cmd = exec.Command("sv", "start", path.Join(config.RunitPath, app.Name))
+	if err := cmd.Run(); err != nil {
+		Fatal("%s: Could not start: %s", app.Name, err)
+		return
+	}
+}
+
+func configureServiceBuilder(config SetliveConfig, app IntentApp) error {
+	sb := map[string]interface{}{}
+	sb[app.Name] = map[string][]string{
+		"run": []string{
+			path.Join(app.Basedir, "current/bin/launch"), // TODO Support directory
+		},
+	}
+
+	data, err := yaml.Marshal(&sb)
+	if err != nil {
+		return err
+	}
+
+	sbFile := path.Join(config.Sbpath, app.Name+".yaml")
+	err = ioutil.WriteFile(sbFile, data, 0644)
+	if err != nil {
+		return err
+	}
+
+	sbCmd := exec.Command("servicebuilder",
+		"-c", config.Sbpath,
+		"-d", config.RunitPath,
+		"-s", config.RunitStagingPath,
+	)
+	if err := sbCmd.Run(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type IntentApp struct {
+	Name     string
+	Versions map[string]string
+	Basedir  string
+}
+
+type IntentNode struct {
+	Apps map[string]IntentApp
+}
+
+func (app *IntentApp) ActiveVersion() string {
+	for id, status := range app.Versions {
+		if status == "active" {
+			return id
+		}
+	}
+	return ""
 }
 
 // TODO: This is duplicated from pp-preparer. DRY it up.
-func pollOnce(hostname string, c chan WorkSpec) error {
+func pollOnce(hostname string, c chan IntentNode) error {
 	Info("Polling intent store")
 	kv, _ := ppkv.NewClient()
 	apps, err := kv.List(path.Join("nodes", hostname))
 	if err != nil {
 		return err
+	}
+
+	intent := IntentNode{
+		Apps: map[string]IntentApp{},
 	}
 
 	for appName, data := range apps {
@@ -172,28 +203,15 @@ func pollOnce(hostname string, c chan WorkSpec) error {
 			continue
 		}
 
-		found := false
-		for version, status := range versions {
-			if status == "active" {
-				found = true
-				Info("Found active version: %s/%s", appName, version)
-				c <- WorkSpec{
-					App:     appName,
-					Version: version,
-					Basedir: basedir,
-				}
-				continue
-			}
-		}
-		if !found {
-			Info("No active version")
-			c <- WorkSpec{
-				App:     appName,
-				Version: "",
-				Basedir: basedir,
-			}
+		intent.Apps[appName] = IntentApp{
+			Name:     appName,
+			Basedir:  basedir,
+			Versions: versions,
 		}
 	}
+
+	c <- intent
+
 	return nil
 }
 
