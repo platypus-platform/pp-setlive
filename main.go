@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"sync"
 )
 
 type SetliveConfig struct {
@@ -29,21 +28,12 @@ func main() {
 		RunitPath:        "/var/service",
 	}
 
-	c := make(chan pp.IntentNode)
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for intent := range c {
-			for _, app := range intent.Apps {
-				setLive(config, app)
-			}
+	err = pp.PollIntent(hostname, func(intent pp.IntentNode) {
+		for _, app := range intent.Apps {
+			setLive(config, app)
 		}
-	}()
+	})
 
-	err = pp.PollOnce(hostname, c)
-	close(c)
-	wg.Wait()
 	if err != nil {
 		Fatal(err.Error())
 		os.Exit(1)
