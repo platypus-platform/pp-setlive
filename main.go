@@ -51,6 +51,7 @@ func setLive(config SetliveConfig, app pp.IntentApp) {
 
 	if version == "" {
 		// TODO: Ensure stopped
+		// TODO: Ensure deregistered
 		Info("%s: No active version, skipping", app.Name)
 		return
 	}
@@ -63,12 +64,62 @@ func setLive(config SetliveConfig, app pp.IntentApp) {
 		return
 	}
 
-	// TODO: obtain lease before stopping, only if running
-	Info("%s: Stopping", app.Name)
-	cmd := exec.Command("sv", "stop", path.Join(config.RunitPath, app.Name))
-	if err := cmd.Run(); err != nil {
-		Fatal("%s: Could not stop: %s", app.Name, err)
+	client, err := pp.NewRealityClient()
+	if err != nil {
+		Fatal("%s: could not connect to reality", app.Name)
 		return
+	}
+
+	currentInstall, err := os.Readlink(current)
+	if err != nil {
+		Warn("%s: error reading link: %s", app.Name, err)
+	}
+
+	healthy, err := client.LocalHealthy(app.Name)
+	if err != nil {
+		Fatal("%s: could not query local health: %s", app.Name, err)
+		return
+	} else if currentInstall == install && healthy {
+		Info("%s: already healthy and current, noop", app.Name)
+		return
+	}
+
+	Info("%s: commencing shutdown", app.Name)
+
+	if healthy {
+		Info("%s: acquiring lease", app.Name)
+		lease := client.AcquireShutdownLease(app.Name, 0)
+		if lease != nil {
+			func() {
+				defer client.ReleaseLease(lease)
+				Info("%s: acquired lease", app.Name)
+
+				cmd := exec.Command("sv", "stop", path.Join(config.RunitPath, app.Name))
+				if err := cmd.Run(); err != nil {
+					Fatal("%s: Could not stop: %s", app.Name, err)
+					return
+				}
+
+				// Do not release lease until unhealthiness has propagated.
+				Info("%s: waiting to become unhealthy", app.Name)
+				if err := client.WaitForLocalUnhealthy(app.Name); err != nil {
+					Fatal("%s: could not query local health: %s", app.Name, err)
+					return
+				}
+			}()
+		} else {
+			Info("%s: did not acquire lease, will try again later", app.Name)
+			return
+		}
+	} else {
+		Info("%s: unhealthy, not acquiring lease", app.Name)
+		// No need to coordinate for unhealthy processes, just ensure they are
+		// stopped.
+		cmd := exec.Command("sv", "stop", path.Join(config.RunitPath, app.Name))
+		if err := cmd.Run(); err != nil {
+			Fatal("%s: Could not stop: %s", app.Name, err)
+			return
+		}
 	}
 
 	// Ensure servicebuilder files up-to-date
@@ -93,11 +144,25 @@ func setLive(config SetliveConfig, app pp.IntentApp) {
 		return
 	}
 
+	// TODO: Allow bin/check in artifacts
+	healthCheck := "grep -q run " +
+		path.Join(config.RunitPath, app.Name, "supervise/stat")
+
+	Info("%s: Registering service", app.Name)
+	client.RegisterService(app.Name, healthCheck)
+
 	Info("%s: Starting", app.Name)
 
-	cmd = exec.Command("sv", "start", path.Join(config.RunitPath, app.Name))
+	cmd := exec.Command("sv", "start", path.Join(config.RunitPath, app.Name))
 	if err := cmd.Run(); err != nil {
 		Fatal("%s: Could not start: %s", app.Name, err)
+		return
+	}
+
+	// Wait for healthy otherwise we may loop again and try to upgrade again
+	// while service is still starting up.
+	if err := client.WaitForLocalHealthy(app.Name); err != nil {
+		Fatal("%s: $rror waiting for healthy: %s", app.Name, err)
 		return
 	}
 }
