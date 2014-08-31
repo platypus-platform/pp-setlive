@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	. "github.com/platypus-platform/pp-logging"
 	"github.com/platypus-platform/pp-store"
 	"gopkg.in/yaml.v1"
@@ -22,11 +23,16 @@ func main() {
 		Fatal(err.Error())
 		os.Exit(1)
 	}
-	config := SetliveConfig{
-		Sbpath:           "/etc/servicebuilder.d",
-		RunitStagingPath: "/var/service-stage",
-		RunitPath:        "/var/service",
-	}
+
+	var config SetliveConfig
+
+	flag.StringVar(&config.Sbpath, "config",
+		"fake/servicebuilder.d", "config directory for servicebuilder")
+	flag.StringVar(&config.RunitStagingPath, "runit-stage",
+		"fake/service-stage", "runit staging directory")
+	flag.StringVar(&config.RunitPath, "runit",
+		"fake/service", "runit directory")
+	flag.Parse()
 
 	err = pp.PollIntent(hostname, func(intent pp.IntentNode) {
 		for _, app := range intent.Apps {
@@ -53,7 +59,7 @@ func setLive(config SetliveConfig, app pp.IntentApp) {
 	current := path.Join(app.Basedir, "current")
 
 	if _, err := os.Stat(install); os.IsNotExist(err) {
-		Info("%s: not prepared, skipping", app)
+		Info("%s: %s not prepared, skipping", app.Name, app.ActiveVersion())
 		return
 	}
 
@@ -75,9 +81,11 @@ func setLive(config SetliveConfig, app pp.IntentApp) {
 
 	Info("%s: Symlinking", app.Name)
 
-	if err := os.Remove(current); err != nil {
-		Fatal("%s: Could not remove current symlink: %s", app.Name, err)
-		return
+	if _, err := os.Stat(current); err == nil {
+		if err := os.Remove(current); err != nil {
+			Fatal("%s: Could not remove current symlink: %s", app.Name, err)
+			return
+		}
 	}
 
 	if err := os.Symlink(install, current); err != nil {
