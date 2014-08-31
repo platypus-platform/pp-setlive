@@ -88,6 +88,7 @@ func setLive(config SetliveConfig, app pp.IntentApp) {
 
 	if healthy {
 		Info("%s: acquiring lease", app.Name)
+		// TODO: Get minnodes from intent store
 		lease := client.AcquireShutdownLease(app.Name, 0)
 		if lease != nil {
 			func() {
